@@ -10,24 +10,24 @@ permissions:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 外部アクション禁止のため、シェルでPython3.11を用意する
-      - name: Ensure Python 3.11
+      - name: Install Python 3.11 (apt)
         run: |
           set -eux
-          if command -v python3.11 >/dev/null 2>&1; then
-            python3.11 --version
-          else
-            sudo apt-get update
-            sudo apt-get install -y python3.11 python3.11-venv python3-pip
-            python3.11 --version
-          fi
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:deadsnakes/ppa
+          sudo apt-get update
+          sudo apt-get install -y python3.11 python3.11-venv python3-pip
+
+          python3.11 --version
+          python3.11 -m pip --version
 
       - name: Install dependencies
         run: |
@@ -42,13 +42,14 @@ jobs:
           set -eux
           python3.11 main.py
 
-      # 50日経過なら空コミット（60日停止回避）
+      # 60日停止回避：最終コミットから50日以上なら空コミットしてpush
       - name: Keepalive empty commit if >50 days
         run: |
           set -eux
           last_ts=$(git log -1 --format=%ct)
           now_ts=$(date +%s)
           days=$(( (now_ts - last_ts) / 86400 ))
+
           if [ "$days" -ge 50 ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"

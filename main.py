@@ -1,6 +1,9 @@
 import os
 import json
 import math
+import time
+import random
+import contextlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -15,6 +18,9 @@ import datetime as dt
 
 
 JST = ZoneInfo("Asia/Tokyo")
+
+# ダウンロード結果キャッシュ（ティッカー -> 日足DF）
+_DATA_CACHE: Dict[str, pd.DataFrame] = {}
 
 
 # -------------------------
@@ -43,6 +49,12 @@ class Settings:
     vol_long: int = 60
     vol_spike_ratio: float = 1.5
     history_years: int = 2
+
+    # 追加（レート制限対策：最大1000銘柄想定）
+    yf_batch_size: int = 50         # まとめて取る単位（大きすぎると失敗が増える）
+    yf_batch_sleep: float = 1.2     # バッチ間の待機（短すぎると踏む）
+    yf_retry_max: int = 3           # リトライ上限（要求どおり）
+    yf_retry_base: float = 2.0      # バックオフ基準秒
 
 
 # -------------------------
@@ -135,8 +147,6 @@ def _brace_balanced_json_block(lines: List[str], start_idx: int) -> Tuple[str, i
                 elif ch == "}":
                     brace -= 1
 
-        # その行で閉じたら終了（brace==0 は「外側の {..} が閉じた」）
-        # ただし開始前に brace が0のままはあり得ないので、少なくとも1回は { を見ている前提
         if brace == 0 and any("{" in x for x in buf):
             return "\n".join(buf).strip(), i + 1
 
@@ -161,11 +171,9 @@ def _parse_kv_multiline(raw: str) -> Dict[str, Any]:
 
         if not line:
             continue
-        # コメントっぽい行は無視（勝手な拡張だが害は少ない）
         if line.startswith("#"):
             continue
 
-        # 区切りを探す（= or :）
         sep_pos = None
         sep = None
         for s in ["=", ":"]:
@@ -180,41 +188,33 @@ def _parse_kv_multiline(raw: str) -> Dict[str, Any]:
         key = line[:sep_pos].strip()
         val = line[sep_pos + 1 :].strip()
 
-        # 値が空で、次行が { ならブロック扱い
         if (val == "" and i < len(lines) and lines[i].lstrip().startswith("{")) or val.startswith("{"):
             if val.startswith("{"):
-                # 同じ行から開始
                 block_start = i - 1
             else:
-                # 次行から開始
                 block_start = i
 
             block_text, next_i = _brace_balanced_json_block(lines, block_start)
             try:
                 out[key] = _relaxed_json_loads(block_text) if isinstance(block_text, str) else json.loads(block_text)
             except Exception:
-                # 最後の手段：そのまま文字列
                 out[key] = block_text
             i = next_i
             continue
 
-        # クォート剥がし（"..." / '...'）
         if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
             val = val[1:-1]
 
-        # 可能なら数値/真偽/JSON を解釈（軽く）
         low = val.lower()
         if low in ("true", "false"):
             out[key] = (low == "true")
         else:
-            # 数値
             try:
                 if "." in val:
                     out[key] = float(val)
                 else:
                     out[key] = int(val)
             except Exception:
-                # JSONっぽい（[ ... ] や { ... }）を解釈
                 vv = val.strip()
                 if (vv.startswith("{") and vv.endswith("}")) or (vv.startswith("[") and vv.endswith("]")):
                     try:
@@ -228,7 +228,6 @@ def _parse_kv_multiline(raw: str) -> Dict[str, Any]:
 
 
 def parse_app_secrets(raw: str) -> Dict[str, Any]:
-    # 1) まず素直に JSON
     try:
         v = json.loads(raw)
         if isinstance(v, dict):
@@ -236,7 +235,6 @@ def parse_app_secrets(raw: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 2) 文字列内改行救済して JSON
     try:
         v = _relaxed_json_loads(raw)
         if isinstance(v, dict):
@@ -244,7 +242,6 @@ def parse_app_secrets(raw: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 3) key=value / key: value の複数行
     v = _parse_kv_multiline(raw)
     if isinstance(v, dict) and v:
         return v
@@ -273,6 +270,10 @@ def load_secrets() -> Tuple[Dict[str, Any], Settings]:
         vol_long=int(settings_in.get("vol_long", 60)),
         vol_spike_ratio=float(settings_in.get("vol_spike_ratio", 1.5)),
         history_years=int(settings_in.get("history_years", 2)),
+        yf_batch_size=int(settings_in.get("yf_batch_size", 50)),
+        yf_batch_sleep=float(settings_in.get("yf_batch_sleep", 1.2)),
+        yf_retry_max=int(settings_in.get("yf_retry_max", 3)),
+        yf_retry_base=float(settings_in.get("yf_retry_base", 2.0)),
     )
     return secrets, s
 
@@ -338,19 +339,8 @@ def compute_row_outputs(
     cost: Optional[float],
     settings: Settings,
 ) -> List[Any]:
-    period = f"{settings.history_years}y"
-
-    try:
-        df = yf.download(
-            tickers=ticker,
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-    except Exception:
-        df = pd.DataFrame()
+    # ここは「個別download」をやめてキャッシュ参照に変更（差分最小）
+    df = _DATA_CACHE.get(ticker)
 
     needed = {"High", "Low", "Close"}
     if df is None or df.empty or not needed.issubset(set(df.columns)):
@@ -531,7 +521,6 @@ def open_worksheet(secrets: Dict[str, Any]):
     if isinstance(sa_val, dict):
         sa_info = sa_val
     elif isinstance(sa_val, str):
-        # 文字列として入っている場合も、壊れていても救済して dict にする
         try:
             sa_info = json.loads(sa_val)
         except Exception:
@@ -553,20 +542,156 @@ def open_worksheet(secrets: Dict[str, Any]):
     return ws
 
 
+# -------------------------
+# yfinance 一括取得（秘匿・レート制限対策）
+# -------------------------
+def _looks_rate_limited(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return ("ratelimit" in s) or ("rate limited" in s) or ("too many requests" in s) or ("429" in s)
+
+
+def _download_batch_silent(tickers: List[str], period: str, retry_max: int, retry_base: float) -> Tuple[Optional[pd.DataFrame], bool]:
+    """
+    download中のstdout/stderrを握りつぶす。ログには何も出さない。
+    戻り値: (df or None, rate_limited_flag)
+    """
+    rate_limited = False
+
+    for attempt in range(1, retry_max + 1):
+        try:
+            with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                df = yf.download(
+                    tickers=tickers,
+                    period=period,
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
+            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                # 空は「取得不能」扱い（原因文字列は出さない）
+                return None, rate_limited
+            return df, rate_limited
+        except Exception as e:
+            if _looks_rate_limited(e):
+                rate_limited = True
+            # バックオフ（最大3回）
+            if attempt < retry_max:
+                wait = retry_base * (2 ** (attempt - 1)) + random.uniform(0.0, 0.7)
+                time.sleep(wait)
+                continue
+            return None, rate_limited
+
+    return None, rate_limited
+
+
+def _split_multi_ticker_df(df: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+    """
+    yf.download 複数ティッカー時の MultiIndex 列を、単一ティッカーの OHLCV DataFrame に戻す。
+    """
+    if df is None or df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        # 典型: columns = (Field, Ticker)
+        try:
+            sub = df.xs(ticker, axis=1, level=1, drop_level=True).copy()
+        except Exception:
+            return None
+        # 必要列だけ残す（存在するものだけ）
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in sub.columns]
+        if not keep:
+            return None
+        return sub[keep].dropna(how="all")
+
+    # 単一ティッカーならそのまま
+    return df.copy()
+
+
+def prefetch_yfinance(tickers: List[str], settings: Settings) -> Dict[str, Any]:
+    """
+    取得結果は _DATA_CACHE に入れる。
+    publicログ用に「件数のみ」返す（銘柄は返さない）。
+    """
+    _DATA_CACHE.clear()
+
+    uniq: List[str] = []
+    seen = set()
+    for t in tickers:
+        if t and t not in seen:
+            uniq.append(t)
+            seen.add(t)
+
+    total = len(uniq)
+    ok = 0
+    fail = 0
+    rate_limited_batches = 0
+
+    period = f"{settings.history_years}y"
+    bs = max(1, int(settings.yf_batch_size))
+    sleep_s = max(0.0, float(settings.yf_batch_sleep))
+
+    for i in range(0, total, bs):
+        batch = uniq[i : i + bs]
+        df, rl = _download_batch_silent(batch, period, settings.yf_retry_max, settings.yf_retry_base)
+        if rl:
+            rate_limited_batches += 1
+
+        if df is None or df.empty:
+            # バッチ全滅
+            fail += len(batch)
+        else:
+            # バッチ内を個別に取り出し、取れたものだけキャッシュ
+            for t in batch:
+                sub = _split_multi_ticker_df(df, t) if len(batch) > 1 else df
+                if sub is None or sub.empty or not {"High", "Low", "Close"}.issubset(set(sub.columns)):
+                    fail += 1
+                    continue
+                _DATA_CACHE[t] = sub
+                ok += 1
+
+        if sleep_s > 0 and (i + bs) < total:
+            time.sleep(sleep_s + random.uniform(0.0, 0.4))
+
+    return {
+        "total": total,
+        "ok": ok,
+        "fail": fail,
+        "rate_limited_batches": rate_limited_batches,
+    }
+
+
 def main():
     today = dt.datetime.now(JST).date()
     skip, reason = is_skip_day_jst(today)
     if skip:
+        # 日付と理由だけ（内容秘匿）
         print(f"[SKIP] {today.isoformat()} JST / {reason}")
         return
 
     secrets, settings = load_secrets()
     ws = open_worksheet(secrets)
 
+    # A=銘柄コード, B=銘柄名（固定・秘匿）, C=取得単価
     rows = ws.get("A2:C")
     if not rows:
-        print("A2:C にデータがありません。終了します。")
+        print("RUN: rows=0")
         return
+
+    # ティッカー抽出（ログに出さない）
+    tickers: List[str] = []
+    for r in rows:
+        t = (r[0] if len(r) > 0 else "").strip()
+        if t:
+            tickers.append(t)
+
+    # yfinance 事前取得（ここでレート制限対策）
+    stats = prefetch_yfinance(tickers, settings)
+
+    # ログは件数のみ（銘柄・内容は出さない）
+    print(
+        f"DL: total={stats['total']} ok={stats['ok']} fail={stats['fail']} rate_limited_batches={stats['rate_limited_batches']} retries<= {settings.yf_retry_max}"
+    )
 
     outputs: List[List[Any]] = []
     for r in rows:
@@ -584,8 +709,11 @@ def main():
 
         outputs.append(compute_row_outputs(ticker, cost, settings))
 
-    ws.update("D2", outputs, value_input_option="USER_ENTERED")
-    print(f"更新完了: {len(outputs)} 行 / 書込範囲 D2:AU{len(outputs)+1}")
+    # 警告回避（名前付き引数）
+    ws.update(range_name="D2", values=outputs, value_input_option="USER_ENTERED")
+
+    # ログは件数のみ（範囲・内容は出さない）
+    print(f"SHEET_UPDATE: rows={len(outputs)}")
 
 
 if __name__ == "__main__":

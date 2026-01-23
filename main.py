@@ -21,13 +21,10 @@ JST = ZoneInfo("Asia/Tokyo")
 # 休場日スキップ（JST）
 # -------------------------
 def is_skip_day_jst(today: dt.date) -> Tuple[bool, str]:
-    # 土日
     if today.weekday() >= 5:
         return True, "土日のためスキップ"
-    # 日本の祝日
     if jpholiday.is_holiday(today):
         return True, "祝日のためスキップ"
-    # 12/31〜1/3（大発会〜大納会ルールの固定休止）
     if (today.month == 12 and today.day == 31) or (today.month == 1 and today.day in (1, 2, 3)):
         return True, "年末年始（12/31〜1/3）のためスキップ"
     return False, ""
@@ -45,30 +42,19 @@ class Settings:
     vol_short: int = 20
     vol_long: int = 60
     vol_spike_ratio: float = 1.5
-    history_years: int = 2  # 目安（yfinance取得期間）
+    history_years: int = 2
 
 
 # -------------------------
-# Secrets(JSON)の「文字列内の実改行」を補正して読み込む
-#   - base64等は使わない（工程増やさない）
-#   - JSON文字列の中に混入した \n を \\n に置換して json.loads を通す
+# Secretsのパース（工程増やさずに頑丈に）
+#   1) JSON
+#   2) 文字列内の実改行などを救済してJSON
+#   3) key=value / key: value の複数行形式（google_service_account_json/settingsは {..} ブロック対応）
 # -------------------------
 def _relaxed_json_loads(raw: str) -> Any:
     """
-    JSONの「文字列リテラル内」に混入した実改行/CR/TABを、
-    それぞれ \\n / \\r / \\t に補正してから json.loads する。
-
-    例：
-      "private_key":"-----BEGIN...\n...\n-----END...\n"
-    ではなく
-      "private_key":"-----BEGIN...
-      ...
-      -----END..."
-    のような“実改行”が混ざっているケースを救済する。
+    JSON文字列リテラル内に混入した実改行/CR/TABを \\n/\\r/\\t に補正してから json.loads。
     """
-    if raw is None:
-        raise json.JSONDecodeError("Empty input", "", 0)
-
     s = raw
     out_chars: List[str] = []
     in_string = False
@@ -77,7 +63,6 @@ def _relaxed_json_loads(raw: str) -> Any:
     for ch in s:
         if in_string:
             if escape:
-                # 直前がバックスラッシュなら、そのまま（\" や \\n 等）
                 out_chars.append(ch)
                 escape = False
                 continue
@@ -92,7 +77,6 @@ def _relaxed_json_loads(raw: str) -> Any:
                 in_string = False
                 continue
 
-            # 文字列内の制御文字を補正（必要最小限）
             if ch == "\n":
                 out_chars.append("\\n")
                 continue
@@ -105,7 +89,6 @@ def _relaxed_json_loads(raw: str) -> Any:
 
             out_chars.append(ch)
         else:
-            # 文字列外
             if ch == '"':
                 out_chars.append(ch)
                 in_string = True
@@ -117,15 +100,165 @@ def _relaxed_json_loads(raw: str) -> Any:
     return json.loads(fixed)
 
 
+def _brace_balanced_json_block(lines: List[str], start_idx: int) -> Tuple[str, int]:
+    """
+    lines[start_idx] から始まる JSONブロック（{...}）を、括弧の対応が取れるまで連結して返す。
+    返り値: (json_text, next_index)
+    """
+    buf: List[str] = []
+    brace = 0
+    in_string = False
+    escape = False
+
+    i = start_idx
+    while i < len(lines):
+        line = lines[i]
+        buf.append(line)
+
+        for ch in line:
+            if in_string:
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                    continue
+            else:
+                if ch == '"':
+                    in_string = True
+                    continue
+                if ch == "{":
+                    brace += 1
+                elif ch == "}":
+                    brace -= 1
+
+        # その行で閉じたら終了（brace==0 は「外側の {..} が閉じた」）
+        # ただし開始前に brace が0のままはあり得ないので、少なくとも1回は { を見ている前提
+        if brace == 0 and any("{" in x for x in buf):
+            return "\n".join(buf).strip(), i + 1
+
+        i += 1
+
+    return "\n".join(buf).strip(), len(lines)
+
+
+def _parse_kv_multiline(raw: str) -> Dict[str, Any]:
+    """
+    APP_SECRETS_JSON がJSONでない場合の救済：
+    - key=value または key: value を複数行で書いたものを辞書化
+    - google_service_account_json / settings が { で始まる場合は、括弧が閉じるまでブロックとして読み込んで JSON として解析
+    """
+    lines = raw.splitlines()
+    out: Dict[str, Any] = {}
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+
+        if not line:
+            continue
+        # コメントっぽい行は無視（勝手な拡張だが害は少ない）
+        if line.startswith("#"):
+            continue
+
+        # 区切りを探す（= or :）
+        sep_pos = None
+        sep = None
+        for s in ["=", ":"]:
+            p = line.find(s)
+            if p != -1:
+                sep_pos = p
+                sep = s
+                break
+        if sep_pos is None:
+            continue
+
+        key = line[:sep_pos].strip()
+        val = line[sep_pos + 1 :].strip()
+
+        # 値が空で、次行が { ならブロック扱い
+        if (val == "" and i < len(lines) and lines[i].lstrip().startswith("{")) or val.startswith("{"):
+            if val.startswith("{"):
+                # 同じ行から開始
+                block_start = i - 1
+            else:
+                # 次行から開始
+                block_start = i
+
+            block_text, next_i = _brace_balanced_json_block(lines, block_start)
+            try:
+                out[key] = _relaxed_json_loads(block_text) if isinstance(block_text, str) else json.loads(block_text)
+            except Exception:
+                # 最後の手段：そのまま文字列
+                out[key] = block_text
+            i = next_i
+            continue
+
+        # クォート剥がし（"..." / '...'）
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+
+        # 可能なら数値/真偽/JSON を解釈（軽く）
+        low = val.lower()
+        if low in ("true", "false"):
+            out[key] = (low == "true")
+        else:
+            # 数値
+            try:
+                if "." in val:
+                    out[key] = float(val)
+                else:
+                    out[key] = int(val)
+            except Exception:
+                # JSONっぽい（[ ... ] や { ... }）を解釈
+                vv = val.strip()
+                if (vv.startswith("{") and vv.endswith("}")) or (vv.startswith("[") and vv.endswith("]")):
+                    try:
+                        out[key] = _relaxed_json_loads(vv)
+                    except Exception:
+                        out[key] = val
+                else:
+                    out[key] = val
+
+    return out
+
+
+def parse_app_secrets(raw: str) -> Dict[str, Any]:
+    # 1) まず素直に JSON
+    try:
+        v = json.loads(raw)
+        if isinstance(v, dict):
+            return v
+    except Exception:
+        pass
+
+    # 2) 文字列内改行救済して JSON
+    try:
+        v = _relaxed_json_loads(raw)
+        if isinstance(v, dict):
+            return v
+    except Exception:
+        pass
+
+    # 3) key=value / key: value の複数行
+    v = _parse_kv_multiline(raw)
+    if isinstance(v, dict) and v:
+        return v
+
+    raise RuntimeError("APP_SECRETS_JSON を解釈できません（JSONまたは key=value / key: value 形式にしてください）")
+
+
 def load_secrets() -> Tuple[Dict[str, Any], Settings]:
     raw = os.environ.get("APP_SECRETS_JSON", "")
     if not isinstance(raw, str) or not raw.strip():
         raise RuntimeError("APP_SECRETS_JSON が未設定です（GitHub Secretsに設定してください）")
 
-    # ここが修正点：改行入りでも落ちないように補正してロード
-    secrets = _relaxed_json_loads(raw)
+    secrets = parse_app_secrets(raw)
 
-    # google_service_account_json は「文字列」でも「オブジェクト」でも受ける
     sa_val = secrets.get("google_service_account_json", None)
     if sa_val is None:
         raise RuntimeError("google_service_account_json が未設定です")
@@ -205,10 +338,6 @@ def compute_row_outputs(
     cost: Optional[float],
     settings: Settings,
 ) -> List[Any]:
-    """
-    出力は「D列〜AU列」の44列ぶん（固定）。
-    A:銘柄コード / B:銘柄名 / C:取得単価 は上書きしない。
-    """
     period = f"{settings.history_years}y"
 
     try:
@@ -327,57 +456,57 @@ def compute_row_outputs(
             add_reason = "見送り：直近が弱い"
 
     out: List[Any] = [
-        price,                          # D
-        pnl if pnl is not None else "", # E
-        pnl_pct if pnl_pct is not None else "",  # F
+        price,
+        pnl if pnl is not None else "",
+        pnl_pct if pnl_pct is not None else "",
 
-        atr14 if atr14 is not None else "",      # G
-        atr50 if atr50 is not None else "",      # H
-        atr100 if atr100 is not None else "",    # I
-        atrp14 if atrp14 is not None else "",    # J
-        atrp50 if atrp50 is not None else "",    # K
-        atrp100 if atrp100 is not None else "",  # L
+        atr14 if atr14 is not None else "",
+        atr50 if atr50 is not None else "",
+        atr100 if atr100 is not None else "",
+        atrp14 if atrp14 is not None else "",
+        atrp50 if atrp50 is not None else "",
+        atrp100 if atrp100 is not None else "",
 
-        sd_14_2 if sd_14_2 is not None else "",  # M
-        sd_14_3 if sd_14_3 is not None else "",  # N
-        sd_50_2 if sd_50_2 is not None else "",  # O
-        sd_50_3 if sd_50_3 is not None else "",  # P
-        sd_100_2 if sd_100_2 is not None else "",# Q
-        sd_100_3 if sd_100_3 is not None else "",# R
+        sd_14_2 if sd_14_2 is not None else "",
+        sd_14_3 if sd_14_3 is not None else "",
+        sd_50_2 if sd_50_2 is not None else "",
+        sd_50_3 if sd_50_3 is not None else "",
+        sd_100_2 if sd_100_2 is not None else "",
+        sd_100_3 if sd_100_3 is not None else "",
 
-        sp_14_2 if sp_14_2 is not None else "",  # S
-        sp_14_3 if sp_14_3 is not None else "",  # T
-        sp_50_2 if sp_50_2 is not None else "",  # U
-        sp_50_3 if sp_50_3 is not None else "",  # V
-        sp_100_2 if sp_100_2 is not None else "",# W
-        sp_100_3 if sp_100_3 is not None else "",# X
+        sp_14_2 if sp_14_2 is not None else "",
+        sp_14_3 if sp_14_3 is not None else "",
+        sp_50_2 if sp_50_2 is not None else "",
+        sp_50_3 if sp_50_3 is not None else "",
+        sp_100_2 if sp_100_2 is not None else "",
+        sp_100_3 if sp_100_3 is not None else "",
 
-        cg_14_2 if cg_14_2 is not None else "",  # Y
-        cg_14_3 if cg_14_3 is not None else "",  # Z
-        cg_50_2 if cg_50_2 is not None else "",  # AA
-        cg_50_3 if cg_50_3 is not None else "",  # AB
-        cg_100_2 if cg_100_2 is not None else "",# AC
-        cg_100_3 if cg_100_3 is not None else "",# AD
+        cg_14_2 if cg_14_2 is not None else "",
+        cg_14_3 if cg_14_3 is not None else "",
+        cg_50_2 if cg_50_2 is not None else "",
+        cg_50_3 if cg_50_3 is not None else "",
+        cg_100_2 if cg_100_2 is not None else "",
+        cg_100_3 if cg_100_3 is not None else "",
 
-        a_14_2,  # AE
-        a_14_3,  # AF
-        a_50_2,  # AG
-        a_50_3,  # AH
-        a_100_2, # AI
-        a_100_3, # AJ
+        a_14_2,
+        a_14_3,
+        a_50_2,
+        a_50_3,
+        a_100_2,
+        a_100_3,
 
-        sell_warn,  # AK
-        sell_msg,   # AL
+        sell_warn,
+        sell_msg,
 
-        ma50 if ma50 is not None else "",        # AM
-        ma200 if ma200 is not None else "",      # AN
-        ("TRUE" if trend else "FALSE") if trend is not None else "",  # AO
-        ret20 if ret20 is not None else "",      # AP
-        vol20 if vol20 is not None else "",      # AQ
-        vol60 if vol60 is not None else "",      # AR
-        ("TRUE" if vol_spike else "FALSE") if vol_spike is not None else "",  # AS
-        add_sig,     # AT
-        add_reason,  # AU
+        ma50 if ma50 is not None else "",
+        ma200 if ma200 is not None else "",
+        ("TRUE" if trend else "FALSE") if trend is not None else "",
+        ret20 if ret20 is not None else "",
+        vol20 if vol20 is not None else "",
+        vol60 if vol60 is not None else "",
+        ("TRUE" if vol_spike else "FALSE") if vol_spike is not None else "",
+        add_sig,
+        add_reason,
     ]
 
     if len(out) != 44:
@@ -395,7 +524,6 @@ def open_worksheet(secrets: Dict[str, Any]):
     if not spreadsheet_id:
         raise RuntimeError("spreadsheet_id が未設定です")
 
-    # ここが修正点：サービスアカウントJSONは「文字列」でも「dict」でも受ける
     sa_val = secrets.get("google_service_account_json", None)
     if sa_val is None:
         raise RuntimeError("google_service_account_json が未設定です")
@@ -403,8 +531,11 @@ def open_worksheet(secrets: Dict[str, Any]):
     if isinstance(sa_val, dict):
         sa_info = sa_val
     elif isinstance(sa_val, str):
-        # 文字列内改行混入も救済してから loads
-        sa_info = _relaxed_json_loads(sa_val)
+        # 文字列として入っている場合も、壊れていても救済して dict にする
+        try:
+            sa_info = json.loads(sa_val)
+        except Exception:
+            sa_info = _relaxed_json_loads(sa_val)
         if not isinstance(sa_info, dict):
             raise RuntimeError("google_service_account_json の解釈結果がdictではありません")
     else:
@@ -432,7 +563,6 @@ def main():
     secrets, settings = load_secrets()
     ws = open_worksheet(secrets)
 
-    # A:銘柄コード / B:銘柄名 / C:取得単価（固定値）
     rows = ws.get("A2:C")
     if not rows:
         print("A2:C にデータがありません。終了します。")
@@ -454,10 +584,7 @@ def main():
 
         outputs.append(compute_row_outputs(ticker, cost, settings))
 
-    # D列〜AU列へ上書き（A/B/Cは触らない）
-    start_cell = "D2"
-    ws.update(start_cell, outputs, value_input_option="USER_ENTERED")
-
+    ws.update("D2", outputs, value_input_option="USER_ENTERED")
     print(f"更新完了: {len(outputs)} 行 / 書込範囲 D2:AU{len(outputs)+1}")
 
 

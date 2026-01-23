@@ -48,17 +48,87 @@ class Settings:
     history_years: int = 2  # 目安（yfinance取得期間）
 
 
+# -------------------------
+# Secrets(JSON)の「文字列内の実改行」を補正して読み込む
+#   - base64等は使わない（工程増やさない）
+#   - JSON文字列の中に混入した \n を \\n に置換して json.loads を通す
+# -------------------------
+def _relaxed_json_loads(raw: str) -> Any:
+    """
+    JSONの「文字列リテラル内」に混入した実改行/CR/TABを、
+    それぞれ \\n / \\r / \\t に補正してから json.loads する。
+
+    例：
+      "private_key":"-----BEGIN...\n...\n-----END...\n"
+    ではなく
+      "private_key":"-----BEGIN...
+      ...
+      -----END..."
+    のような“実改行”が混ざっているケースを救済する。
+    """
+    if raw is None:
+        raise json.JSONDecodeError("Empty input", "", 0)
+
+    s = raw
+    out_chars: List[str] = []
+    in_string = False
+    escape = False
+
+    for ch in s:
+        if in_string:
+            if escape:
+                # 直前がバックスラッシュなら、そのまま（\" や \\n 等）
+                out_chars.append(ch)
+                escape = False
+                continue
+
+            if ch == "\\":
+                out_chars.append(ch)
+                escape = True
+                continue
+
+            if ch == '"':
+                out_chars.append(ch)
+                in_string = False
+                continue
+
+            # 文字列内の制御文字を補正（必要最小限）
+            if ch == "\n":
+                out_chars.append("\\n")
+                continue
+            if ch == "\r":
+                out_chars.append("\\r")
+                continue
+            if ch == "\t":
+                out_chars.append("\\t")
+                continue
+
+            out_chars.append(ch)
+        else:
+            # 文字列外
+            if ch == '"':
+                out_chars.append(ch)
+                in_string = True
+                escape = False
+                continue
+            out_chars.append(ch)
+
+    fixed = "".join(out_chars)
+    return json.loads(fixed)
+
+
 def load_secrets() -> Tuple[Dict[str, Any], Settings]:
-    raw = os.environ.get("APP_SECRETS_JSON", "").strip()
-    if not raw:
+    raw = os.environ.get("APP_SECRETS_JSON", "")
+    if not isinstance(raw, str) or not raw.strip():
         raise RuntimeError("APP_SECRETS_JSON が未設定です（GitHub Secretsに設定してください）")
 
-    secrets = json.loads(raw)
+    # ここが修正点：改行入りでも落ちないように補正してロード
+    secrets = _relaxed_json_loads(raw)
 
-    # サービスアカウントJSONは「文字列として」入っている前提
-    sa_json_str = secrets.get("google_service_account_json", "")
-    if not isinstance(sa_json_str, str) or not sa_json_str.strip():
-        raise RuntimeError("google_service_account_json が不正です（文字列で入れてください）")
+    # google_service_account_json は「文字列」でも「オブジェクト」でも受ける
+    sa_val = secrets.get("google_service_account_json", None)
+    if sa_val is None:
+        raise RuntimeError("google_service_account_json が未設定です")
 
     settings_in = secrets.get("settings", {}) or {}
     s = Settings(
@@ -139,8 +209,6 @@ def compute_row_outputs(
     出力は「D列〜AU列」の44列ぶん（固定）。
     A:銘柄コード / B:銘柄名 / C:取得単価 は上書きしない。
     """
-    # 取得期間（目安：history_years）
-    # yfinanceのperiodは "1y","2y" などが簡単。2年固定でよい。
     period = f"{settings.history_years}y"
 
     try:
@@ -155,12 +223,10 @@ def compute_row_outputs(
     except Exception:
         df = pd.DataFrame()
 
-    # 空 or 必要列不足
     needed = {"High", "Low", "Close"}
     if df is None or df.empty or not needed.issubset(set(df.columns)):
         return ["取得失敗"] + [""] * (44 - 1)
 
-    # 欠損除去
     df = df.dropna(subset=["High", "Low", "Close"]).copy()
     if len(df) < 5:
         return ["取得失敗"] + [""] * (44 - 1)
@@ -168,11 +234,9 @@ def compute_row_outputs(
     close = df["Close"]
     price = float(close.iloc[-1])
 
-    # 含み損益
     pnl = (price - cost) if cost is not None else None
     pnl_pct = (price / cost - 1.0) if (cost is not None and cost != 0) else None
 
-    # ATR
     atr14 = atr_sma(df, 14)
     atr50 = atr_sma(df, 50)
     atr100 = atr_sma(df, 100)
@@ -181,7 +245,6 @@ def compute_row_outputs(
     atrp50 = (atr50 / price) if (atr50 is not None and price != 0) else None
     atrp100 = (atr100 / price) if (atr100 is not None and price != 0) else None
 
-    # Stop distances
     def mul(x: Optional[float], m: int) -> Optional[float]:
         return None if x is None else float(x * m)
 
@@ -192,7 +255,6 @@ def compute_row_outputs(
     sd_100_2 = mul(atr100, 2)
     sd_100_3 = mul(atr100, 3)
 
-    # Stop prices (current price - stop distance)
     def stop_price(distance: Optional[float]) -> Optional[float]:
         return None if distance is None else float(price - distance)
 
@@ -203,7 +265,6 @@ def compute_row_outputs(
     sp_100_2 = stop_price(sd_100_2)
     sp_100_3 = stop_price(sd_100_3)
 
-    # Cost-based stop gap (cost - stop_price)
     def cost_gap(sp: Optional[float]) -> Optional[float]:
         if cost is None or sp is None:
             return None
@@ -216,7 +277,6 @@ def compute_row_outputs(
     cg_100_2 = cost_gap(sp_100_2)
     cg_100_3 = cost_gap(sp_100_3)
 
-    # Stop proximity alerts
     near = settings.near_atr_factor
     a_14_2 = stop_proximity(price, sp_14_2, atr14, near)
     a_14_3 = stop_proximity(price, sp_14_3, atr14, near)
@@ -225,14 +285,12 @@ def compute_row_outputs(
     a_100_2 = stop_proximity(price, sp_100_2, atr100, near)
     a_100_3 = stop_proximity(price, sp_100_3, atr100, near)
 
-    # MA / momentum
     ma50 = sma(close, 50)
     ma200 = sma(close, 200)
     trend = None
     if ma50 is not None and ma200 is not None:
         trend = (ma50 > ma200)
 
-    # Sell warning (uses MA50/MA200)
     if trend is None:
         sell_warn = ""
         sell_msg = ""
@@ -243,7 +301,6 @@ def compute_row_outputs(
         sell_warn = "強（トレンド崩れ：売り準備）"
         sell_msg = "モメンタム崩れ：売り局面が近い（MA50<=MA200）。買い増し禁止。撤退（売却）を検討"
 
-    # ret / vol
     ret20 = ret_n(close, settings.ret_lookback)
     vol20 = vol_annualized(close, settings.vol_short)
     vol60 = vol_annualized(close, settings.vol_long)
@@ -252,7 +309,6 @@ def compute_row_outputs(
     if vol20 is not None and vol60 is not None:
         vol_spike = (vol20 > settings.vol_spike_ratio * vol60)
 
-    # Add signal
     if trend is None or ret20 is None or vol_spike is None:
         add_sig = "見送り"
         add_reason = "見送り：データ不足"
@@ -270,11 +326,6 @@ def compute_row_outputs(
             add_sig = "見送り"
             add_reason = "見送り：直近が弱い"
 
-    # Outputs D..AU (44 cols)
-    # D 現在値, E 値幅, F %, G ATR14, H ATR50, I ATR100, J ATR%14, K ATR%50, L ATR%100,
-    # M..R stop distances, S..X stop prices, Y..AD cost gaps,
-    # AE..AJ stop proximity, AK sell warn, AL sell msg,
-    # AM MA50, AN MA200, AO trend flag, AP ret20, AQ vol20, AR vol60, AS vol spike, AT add, AU reason
     out: List[Any] = [
         price,                          # D
         pnl if pnl is not None else "", # E
@@ -329,7 +380,6 @@ def compute_row_outputs(
         add_reason,  # AU
     ]
 
-    # 44列厳守
     if len(out) != 44:
         raise RuntimeError(f"出力列数が不正: {len(out)}（44が必要）")
 
@@ -340,13 +390,25 @@ def compute_row_outputs(
 # Sheets I/O
 # -------------------------
 def open_worksheet(secrets: Dict[str, Any]):
-    spreadsheet_id = secrets.get("spreadsheet_id", "").strip()
-    sheet_name = secrets.get("sheet_name", "Holdings").strip()
+    spreadsheet_id = str(secrets.get("spreadsheet_id", "")).strip()
+    sheet_name = str(secrets.get("sheet_name", "Holdings")).strip()
     if not spreadsheet_id:
         raise RuntimeError("spreadsheet_id が未設定です")
 
-    sa_json_str = secrets["google_service_account_json"]
-    sa_info = json.loads(sa_json_str)
+    # ここが修正点：サービスアカウントJSONは「文字列」でも「dict」でも受ける
+    sa_val = secrets.get("google_service_account_json", None)
+    if sa_val is None:
+        raise RuntimeError("google_service_account_json が未設定です")
+
+    if isinstance(sa_val, dict):
+        sa_info = sa_val
+    elif isinstance(sa_val, str):
+        # 文字列内改行混入も救済してから loads
+        sa_info = _relaxed_json_loads(sa_val)
+        if not isinstance(sa_info, dict):
+            raise RuntimeError("google_service_account_json の解釈結果がdictではありません")
+    else:
+        raise RuntimeError("google_service_account_json は文字列またはオブジェクトで指定してください")
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -361,7 +423,6 @@ def open_worksheet(secrets: Dict[str, Any]):
 
 
 def main():
-    # 休場日スキップ
     today = dt.datetime.now(JST).date()
     skip, reason = is_skip_day_jst(today)
     if skip:
@@ -372,7 +433,6 @@ def main():
     ws = open_worksheet(secrets)
 
     # A:銘柄コード / B:銘柄名 / C:取得単価（固定値）
-    # 2行目以降を読み込む。空ティッカー行はスキップせず、出力は空で埋める（行ズレ防止）。
     rows = ws.get("A2:C")
     if not rows:
         print("A2:C にデータがありません。終了します。")
@@ -381,7 +441,6 @@ def main():
     outputs: List[List[Any]] = []
     for r in rows:
         ticker = (r[0] if len(r) > 0 else "").strip()
-        # name = (r[1] if len(r) > 1 else "").strip()  # 使わない（固定値）
         cost_raw = (r[2] if len(r) > 2 else "")
         cost = None
         try:
@@ -396,7 +455,6 @@ def main():
         outputs.append(compute_row_outputs(ticker, cost, settings))
 
     # D列〜AU列へ上書き（A/B/Cは触らない）
-    # 出力行数は入力行数と一致
     start_cell = "D2"
     ws.update(start_cell, outputs, value_input_option="USER_ENTERED")
 

@@ -1,0 +1,59 @@
+name: sell-increase-signal
+
+on:
+  schedule:
+    - cron: "31 6 * * 1-5" # 平日15:31 JST（UTC 06:31）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 外部アクション禁止のため、シェルでPython3.11を用意する
+      - name: Ensure Python 3.11
+        run: |
+          set -eux
+          if command -v python3.11 >/dev/null 2>&1; then
+            python3.11 --version
+          else
+            sudo apt-get update
+            sudo apt-get install -y python3.11 python3.11-venv python3-pip
+            python3.11 --version
+          fi
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          python3.11 -m pip install --upgrade pip
+          python3.11 -m pip install -r requirements.txt
+
+      - name: Run main
+        env:
+          APP_SECRETS_JSON: ${{ secrets.APP_SECRETS_JSON }}
+        run: |
+          set -eux
+          python3.11 main.py
+
+      # 50日経過なら空コミット（60日停止回避）
+      - name: Keepalive empty commit if >50 days
+        run: |
+          set -eux
+          last_ts=$(git log -1 --format=%ct)
+          now_ts=$(date +%s)
+          days=$(( (now_ts - last_ts) / 86400 ))
+          if [ "$days" -ge 50 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive"
+            git push
+          else
+            echo "No keepalive needed: ${days} days since last commit"
+          fi

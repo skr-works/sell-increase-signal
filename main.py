@@ -19,7 +19,7 @@ import datetime as dt
 
 JST = ZoneInfo("Asia/Tokyo")
 
-# ダウンロード結果キャッシュ（ティッカー -> 日足DF）
+# ダウンロード結果キャッシュ（スプシの銘柄コード -> 日足DF）
 _DATA_CACHE: Dict[str, pd.DataFrame] = {}
 
 
@@ -50,11 +50,11 @@ class Settings:
     vol_spike_ratio: float = 1.5
     history_years: int = 2
 
-    # 追加（レート制限対策：最大1000銘柄想定）
-    yf_batch_size: int = 50         # まとめて取る単位（大きすぎると失敗が増える）
-    yf_batch_sleep: float = 1.2     # バッチ間の待機（短すぎると踏む）
-    yf_retry_max: int = 3           # リトライ上限（要求どおり）
-    yf_retry_base: float = 2.0      # バックオフ基準秒
+    # レート制限対策（最大1000銘柄想定）
+    yf_batch_size: int = 50
+    yf_batch_sleep: float = 1.2
+    yf_retry_max: int = 3
+    yf_retry_base: float = 2.0
 
 
 # -------------------------
@@ -279,6 +279,19 @@ def load_secrets() -> Tuple[Dict[str, Any], Settings]:
 
 
 # -------------------------
+# ティッカー正規化（downloadに渡すものだけ変える）
+# -------------------------
+def normalize_yf_ticker(raw_ticker: str) -> str:
+    t = (raw_ticker or "").strip()
+    if not t:
+        return t
+    # 先頭が数字 & "." を含まない -> 日本株コード扱いで ".T"
+    if t[0].isdigit() and ("." not in t):
+        return t + ".T"
+    return t
+
+
+# -------------------------
 # yfinance → 指標計算
 # -------------------------
 def true_range(df: pd.DataFrame) -> pd.Series:
@@ -339,7 +352,6 @@ def compute_row_outputs(
     cost: Optional[float],
     settings: Settings,
 ) -> List[Any]:
-    # ここは「個別download」をやめてキャッシュ参照に変更（差分最小）
     df = _DATA_CACHE.get(ticker)
 
     needed = {"High", "Low", "Close"}
@@ -569,13 +581,11 @@ def _download_batch_silent(tickers: List[str], period: str, retry_max: int, retr
                     threads=False,
                 )
             if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-                # 空は「取得不能」扱い（原因文字列は出さない）
                 return None, rate_limited
             return df, rate_limited
         except Exception as e:
             if _looks_rate_limited(e):
                 rate_limited = True
-            # バックオフ（最大3回）
             if attempt < retry_max:
                 wait = retry_base * (2 ** (attempt - 1)) + random.uniform(0.0, 0.7)
                 time.sleep(wait)
@@ -585,44 +595,57 @@ def _download_batch_silent(tickers: List[str], period: str, retry_max: int, retr
     return None, rate_limited
 
 
-def _split_multi_ticker_df(df: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+def _split_multi_ticker_df(df: pd.DataFrame, yf_ticker: str) -> Optional[pd.DataFrame]:
     """
     yf.download 複数ティッカー時の MultiIndex 列を、単一ティッカーの OHLCV DataFrame に戻す。
+    形式差を吸収するため、level=1 と level=0 を両方試す。
     """
     if df is None or df.empty:
         return None
 
     if isinstance(df.columns, pd.MultiIndex):
-        # 典型: columns = (Field, Ticker)
+        sub = None
+        # 典型: (Field, Ticker)
         try:
-            sub = df.xs(ticker, axis=1, level=1, drop_level=True).copy()
+            sub = df.xs(yf_ticker, axis=1, level=1, drop_level=True).copy()
         except Exception:
+            sub = None
+        # 逆: (Ticker, Field)
+        if sub is None:
+            try:
+                sub = df.xs(yf_ticker, axis=1, level=0, drop_level=True).copy()
+            except Exception:
+                sub = None
+
+        if sub is None or sub.empty:
             return None
-        # 必要列だけ残す（存在するものだけ）
+
         keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in sub.columns]
         if not keep:
             return None
         return sub[keep].dropna(how="all")
 
-    # 単一ティッカーならそのまま
     return df.copy()
 
 
-def prefetch_yfinance(tickers: List[str], settings: Settings) -> Dict[str, Any]:
+def prefetch_yfinance(raw_tickers: List[str], settings: Settings) -> Dict[str, Any]:
     """
-    取得結果は _DATA_CACHE に入れる。
-    publicログ用に「件数のみ」返す（銘柄は返さない）。
+    取得結果は _DATA_CACHE に入れる（キーはスプシの銘柄コード）。
+    publicログ用に「件数のみ」返す。
     """
     _DATA_CACHE.clear()
 
-    uniq: List[str] = []
-    seen = set()
-    for t in tickers:
-        if t and t not in seen:
-            uniq.append(t)
-            seen.add(t)
+    # raw -> yf の対応を作る（スプシはrawのまま）
+    yf_to_raws: Dict[str, List[str]] = {}
+    for raw in raw_tickers:
+        r = (raw or "").strip()
+        if not r:
+            continue
+        yf_t = normalize_yf_ticker(r)
+        yf_to_raws.setdefault(yf_t, []).append(r)
 
-    total = len(uniq)
+    uniq_yf = list(yf_to_raws.keys())
+    total = len(uniq_yf)
     ok = 0
     fail = 0
     rate_limited_batches = 0
@@ -632,29 +655,31 @@ def prefetch_yfinance(tickers: List[str], settings: Settings) -> Dict[str, Any]:
     sleep_s = max(0.0, float(settings.yf_batch_sleep))
 
     for i in range(0, total, bs):
-        batch = uniq[i : i + bs]
-        df, rl = _download_batch_silent(batch, period, settings.yf_retry_max, settings.yf_retry_base)
+        batch_yf = uniq_yf[i : i + bs]
+        df, rl = _download_batch_silent(batch_yf, period, settings.yf_retry_max, settings.yf_retry_base)
         if rl:
             rate_limited_batches += 1
 
         if df is None or df.empty:
             # バッチ全滅
-            fail += len(batch)
+            for yf_t in batch_yf:
+                fail += len(yf_to_raws.get(yf_t, []))
         else:
-            # バッチ内を個別に取り出し、取れたものだけキャッシュ
-            for t in batch:
-                sub = _split_multi_ticker_df(df, t) if len(batch) > 1 else df
+            for yf_t in batch_yf:
+                sub = _split_multi_ticker_df(df, yf_t) if len(batch_yf) > 1 else df
                 if sub is None or sub.empty or not {"High", "Low", "Close"}.issubset(set(sub.columns)):
-                    fail += 1
+                    fail += len(yf_to_raws.get(yf_t, []))
                     continue
-                _DATA_CACHE[t] = sub
-                ok += 1
+                # キャッシュは raw で持つ（以降の処理は変えない）
+                for raw in yf_to_raws.get(yf_t, []):
+                    _DATA_CACHE[raw] = sub
+                    ok += 1
 
         if sleep_s > 0 and (i + bs) < total:
             time.sleep(sleep_s + random.uniform(0.0, 0.4))
 
     return {
-        "total": total,
+        "total": sum(len(v) for v in yf_to_raws.values()),  # raw件数
         "ok": ok,
         "fail": fail,
         "rate_limited_batches": rate_limited_batches,
@@ -665,7 +690,6 @@ def main():
     today = dt.datetime.now(JST).date()
     skip, reason = is_skip_day_jst(today)
     if skip:
-        # 日付と理由だけ（内容秘匿）
         print(f"[SKIP] {today.isoformat()} JST / {reason}")
         return
 
@@ -678,17 +702,15 @@ def main():
         print("RUN: rows=0")
         return
 
-    # ティッカー抽出（ログに出さない）
     tickers: List[str] = []
     for r in rows:
         t = (r[0] if len(r) > 0 else "").strip()
         if t:
             tickers.append(t)
 
-    # yfinance 事前取得（ここでレート制限対策）
     stats = prefetch_yfinance(tickers, settings)
 
-    # ログは件数のみ（銘柄・内容は出さない）
+    # ログは件数のみ
     print(
         f"DL: total={stats['total']} ok={stats['ok']} fail={stats['fail']} rate_limited_batches={stats['rate_limited_batches']} retries<= {settings.yf_retry_max}"
     )
@@ -709,10 +731,9 @@ def main():
 
         outputs.append(compute_row_outputs(ticker, cost, settings))
 
-    # 警告回避（名前付き引数）
     ws.update(range_name="D2", values=outputs, value_input_option="USER_ENTERED")
 
-    # ログは件数のみ（範囲・内容は出さない）
+    # ログは件数のみ
     print(f"SHEET_UPDATE: rows={len(outputs)}")
 
 

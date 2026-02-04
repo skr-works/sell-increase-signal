@@ -51,10 +51,10 @@ class Settings:
     history_years: int = 2
 
     # レート制限対策（最大1000銘柄想定）
-    yf_batch_size: int = 50
-    yf_batch_sleep: float = 1.2
-    yf_retry_max: int = 3
-    yf_retry_base: float = 2.0
+    yf_batch_size: int = 20
+    yf_batch_sleep: float = 1.0
+    yf_retry_max: int = 5
+    yf_retry_base: float = 3.0
 
 
 # -------------------------
@@ -270,10 +270,10 @@ def load_secrets() -> Tuple[Dict[str, Any], Settings]:
         vol_long=int(settings_in.get("vol_long", 60)),
         vol_spike_ratio=float(settings_in.get("vol_spike_ratio", 1.5)),
         history_years=int(settings_in.get("history_years", 2)),
-        yf_batch_size=int(settings_in.get("yf_batch_size", 50)),
-        yf_batch_sleep=float(settings_in.get("yf_batch_sleep", 1.2)),
-        yf_retry_max=int(settings_in.get("yf_retry_max", 3)),
-        yf_retry_base=float(settings_in.get("yf_retry_base", 2.0)),
+        yf_batch_size=int(settings_in.get("yf_batch_size", 20)),
+        yf_batch_sleep=float(settings_in.get("yf_batch_sleep", 1.0)),
+        yf_retry_max=int(settings_in.get("yf_retry_max", 5)),
+        yf_retry_base=float(settings_in.get("yf_retry_base", 3.0)),
     )
     return secrets, s
 

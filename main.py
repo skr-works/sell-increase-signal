@@ -6,6 +6,9 @@ import random
 import contextlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Optional
+import re
+import tempfile
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -620,7 +623,7 @@ def _split_multi_ticker_df(df: pd.DataFrame, yf_ticker: str) -> Optional[pd.Data
         if sub is None or sub.empty:
             return None
 
-        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in sub.columns]
+        keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in sub.columns]
         if not keep:
             return None
         return sub[keep].dropna(how="all")
@@ -686,6 +689,339 @@ def prefetch_yfinance(raw_tickers: List[str], settings: Settings) -> Dict[str, A
     }
 
 
+# -------------------------
+# 追加：最小限のポートフォリオ管理（列は4つだけ追加）
+#   AW=時価, AX=ウェイト, AY=含み損益(円), AZ=セクター(33業種)
+#   上部(A1:J3, K1:R3)に集計・ストレスを出す
+# -------------------------
+_JPX_LIST_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+
+
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "":
+        return None
+    s = s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _extract_code(raw_ticker: str) -> Optional[str]:
+    t = (raw_ticker or "").strip()
+    if not t:
+        return None
+    m = re.match(r"^(\d{4,5})", t)
+    if not m:
+        return None
+    return m.group(1).zfill(4)
+
+
+def _load_jpx_sector_map() -> Dict[str, str]:
+    """
+    JPXの公開「上場銘柄一覧」相当のExcelから、コード -> 33業種区分 を作る。
+    失敗したら空dictを返す（セクターは空欄になる）。
+    """
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".xls", delete=False) as tf:
+            tmp_path = tf.name
+        urllib.request.urlretrieve(_JPX_LIST_URL, tmp_path)
+        df = pd.read_excel(tmp_path, dtype=str)
+        os.remove(tmp_path)
+
+        code_col = None
+        sector_col = None
+
+        # 列名はJPX側で揺れるため、包含で拾う
+        for c in df.columns:
+            cs = str(c)
+            if code_col is None and ("コード" in cs):
+                code_col = c
+            if sector_col is None and ("33" in cs and "業種" in cs):
+                sector_col = c
+
+        if code_col is None or sector_col is None:
+            return {}
+
+        out: Dict[str, str] = {}
+        for _, row in df.iterrows():
+            code_raw = row.get(code_col, "")
+            sec_raw = row.get(sector_col, "")
+            if code_raw is None:
+                continue
+            code_s = str(code_raw).strip()
+            if code_s == "":
+                continue
+            # "7203.0" みたいなのを救済
+            code_s = re.sub(r"\.0+$", "", code_s)
+            if not re.match(r"^\d{4,5}$", code_s):
+                continue
+            code_s = code_s.zfill(4)
+
+            sec_s = "" if sec_raw is None else str(sec_raw).strip()
+            if sec_s == "":
+                continue
+
+            out[code_s] = sec_s
+
+        return out
+    except Exception:
+        return {}
+
+
+def _build_sector_for_raws(raw_tickers: List[str]) -> Dict[str, str]:
+    """
+    raw_ticker -> 33業種（取れない場合は ""）
+    """
+    code_to_sector = _load_jpx_sector_map()
+    out: Dict[str, str] = {}
+    if not code_to_sector:
+        for t in raw_tickers:
+            out[t] = ""
+        return out
+
+    for t in raw_tickers:
+        code = _extract_code(t)
+        out[t] = code_to_sector.get(code, "") if code else ""
+    return out
+
+
+def _build_returns_matrix(raw_tickers: List[str], min_obs: int = 60) -> pd.DataFrame:
+    """
+    _DATA_CACHE から Adj Close優先で価格系列を集め、日次リターンDF（列=raw_ticker）を返す。
+    """
+    series_list: List[pd.Series] = []
+    for t in raw_tickers:
+        df = _DATA_CACHE.get(t)
+        if df is None or df.empty:
+            continue
+        col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+        if col is None:
+            continue
+        s = df[col].dropna()
+        if len(s) < (min_obs + 1):
+            continue
+        s.name = t
+        series_list.append(s)
+
+    if not series_list:
+        return pd.DataFrame()
+
+    prices = pd.concat(series_list, axis=1)
+    rets = prices.pct_change()
+    rets = rets.dropna(how="all")
+    # NaNが多い列を落とす（最小観測数）
+    ok_cols = [c for c in rets.columns if rets[c].dropna().shape[0] >= min_obs]
+    rets = rets[ok_cols]
+    # ここでは簡素に共通日だけ使う（行NaNを落とす）
+    rets = rets.dropna(how="any")
+    return rets
+
+
+def _fmt_top3_pairs(items: List[Tuple[str, float]], unit: str) -> str:
+    """
+    code:value を3つまで短く整形
+    unit: "yen" or "pct" or "rho"
+    """
+    out = []
+    for k, v in items[:3]:
+        if unit == "yen":
+            out.append(f"{k}:{int(round(v)):,}")
+        elif unit == "pct":
+            out.append(f"{k}:{v*100:.1f}%")
+        elif unit == "rho":
+            out.append(f"{k}:{v:.2f}")
+        else:
+            out.append(f"{k}:{v}")
+    return ", ".join(out)
+
+
+def _compute_portfolio_and_write_top(ws, rows: List[List[Any]], outputs44: List[List[Any]], extras4: List[List[Any]], sector_map: Dict[str, str]):
+    """
+    rows: A5:D の取得結果
+    outputs44: E5:AV の書き込み予定値
+    extras4: AW5:AZ の書き込み予定値（AW/AX/AY/AZ）
+    セルA1:J3、K1:R3に集計とストレスを書き込む。
+    """
+    now_jst = dt.datetime.now(JST)
+    now_str = now_jst.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 有効行の抽出
+    tickers: List[str] = []
+    shares_map: Dict[str, float] = {}
+    cost_map: Dict[str, float] = {}
+    price_map: Dict[str, float] = {}
+    pnl_map: Dict[str, float] = {}
+    mv_map: Dict[str, float] = {}
+
+    total_input = 0
+    ok_price = 0
+
+    for i, r in enumerate(rows):
+        t = (r[0] if len(r) > 0 else "").strip()
+        if not t:
+            continue
+        total_input += 1
+
+        sh = _to_float(r[2] if len(r) > 2 else None)
+        cost = _to_float(r[3] if len(r) > 3 else None)
+        sh = float(sh) if sh is not None else 0.0
+        shares_map[t] = sh
+        if cost is not None:
+            cost_map[t] = float(cost)
+
+        o = outputs44[i]
+        # priceは先頭（取得失敗の場合は文字列）
+        price = o[0]
+        if isinstance(price, (int, float)) and sh > 0:
+            ok_price += 1
+            price_map[t] = float(price)
+            mv = float(price) * sh
+            mv_map[t] = mv
+            if cost is not None:
+                pnl_map[t] = (float(price) - float(cost)) * sh
+        tickers.append(t)
+
+    total_mv = sum(mv_map.values())
+    # extras4 のウェイト（AX）を埋め直す（AW/AY/セクターは既に入ってる想定）
+    if total_mv > 0:
+        for i, r in enumerate(rows):
+            t = (r[0] if len(r) > 0 else "").strip()
+            if not t:
+                continue
+            mv = mv_map.get(t, 0.0)
+            extras4[i][1] = (mv / total_mv) if mv > 0 else ""
+
+    # 集中度
+    weights = [v / total_mv for v in mv_map.values()] if total_mv > 0 else []
+    top1 = max(weights) if weights else None
+    top5 = sum(sorted(weights, reverse=True)[:5]) if weights else None
+    hhi = sum(w * w for w in weights) if weights else None
+
+    # セクター偏り（既知セクターのみ）
+    sector_weights: Dict[str, float] = {}
+    for t, mv in mv_map.items():
+        sec = sector_map.get(t, "")
+        if not sec:
+            continue
+        sector_weights[sec] = sector_weights.get(sec, 0.0) + mv
+    max_sector_ratio = None
+    if sector_weights and total_mv > 0:
+        max_sector_ratio = max(sector_weights.values()) / total_mv
+
+    # リターン行列（VaR/相関）
+    rets = _build_returns_matrix(list(mv_map.keys()), min_obs=60)
+    var95 = None
+    var99 = None
+    worst = None
+    corr_pair = ("", 0.0)
+    var_contrib: List[Tuple[str, float]] = []
+
+    if not rets.empty and total_mv > 0:
+        cols = list(rets.columns)
+        w = np.array([mv_map.get(c, 0.0) for c in cols], dtype=float)
+        if w.sum() > 0:
+            w = w / w.sum()
+            rp = rets.values @ w
+            q05 = float(np.quantile(rp, 0.05))
+            q01 = float(np.quantile(rp, 0.01))
+            var95 = max(0.0, -q05)
+            var99 = max(0.0, -q01)
+            worst = float(np.min(rp))
+
+            # 相関上位ペア（最大の正の相関）
+            corr = rets.corr().values
+            if corr.shape[0] >= 2:
+                iu = np.triu_indices(corr.shape[0], k=1)
+                vals = corr[iu]
+                if vals.size > 0:
+                    k = int(np.nanargmax(vals))
+                    i0 = int(iu[0][k])
+                    j0 = int(iu[1][k])
+                    corr_pair = (f"{cols[i0]}-{cols[j0]}", float(vals[k]))
+
+            # VaR寄与（共分散ベースの近似 → VaR95へスケール）
+            Sigma = np.cov(rets.values, rowvar=False, ddof=1)
+            port_var = float(w.T @ Sigma @ w)
+            if port_var > 0:
+                port_sigma = math.sqrt(port_var)
+                m = Sigma @ w
+                comp_sigma = w * m / port_sigma  # volatility contribution (decimal)
+                if var95 is not None and port_sigma > 0:
+                    factor = var95 / port_sigma
+                    comp_var = comp_sigma * factor  # VaR95 contribution (decimal)
+                    pairs = list(zip(cols, comp_var))
+                    pairs.sort(key=lambda x: x[1], reverse=True)
+                    var_contrib = pairs[:3]
+
+    # 含み損TOP3（損が大きい=最も負の値）
+    loss_items: List[Tuple[str, float]] = []
+    for t, pnl in pnl_map.items():
+        if pnl < 0:
+            loss_items.append((t, pnl))
+    loss_items.sort(key=lambda x: x[1])  # もっとも負のものが先
+    loss_top3 = loss_items[:3]
+
+    # A1:J3 に書く
+    a1j3: List[List[Any]] = [
+        ["更新日時(JST)", now_str, "総時価(円)", (total_mv if total_mv > 0 else ""), "含み損益(円)", (sum(pnl_map.values()) if pnl_map else 0.0), "上位1比率", (top1 if top1 is not None else ""), "上位5比率", (top5 if top5 is not None else "")],
+        ["VaR95(1日)", (var95 if var95 is not None else ""), "VaR95(円)", ((var95 * total_mv) if (var95 is not None and total_mv > 0) else ""), "VaR99(1日)", (var99 if var99 is not None else ""), "VaR99(円)", ((var99 * total_mv) if (var99 is not None and total_mv > 0) else ""), "カバレッジ", f"{ok_price}/{total_input}"],
+        ["HHI(集中度)", (hhi if hhi is not None else ""), "最大セクター比率", (max_sector_ratio if max_sector_ratio is not None else ""), "含み損TOP3", (_fmt_top3_pairs(loss_top3, "yen") if loss_top3 else ""), "VaR寄与TOP3", (_fmt_top3_pairs(var_contrib, "pct") if var_contrib else ""), "相関上位ペア", (f"{corr_pair[0]}:{corr_pair[1]:.2f}" if corr_pair[0] else "")],
+    ]
+    ws.update(range_name="A1", values=a1j3, value_input_option="USER_ENTERED")
+
+    # ストレス K1:R3（8本）
+    # 影響(%)は負の値で表現（損失）
+    def _w_sum(keys: List[str]) -> float:
+        if total_mv <= 0:
+            return 0.0
+        return sum(mv_map.get(k, 0.0) for k in keys) / total_mv
+
+    # Top銘柄
+    sorted_by_w = sorted(mv_map.items(), key=lambda x: x[1], reverse=True)
+    top1_t = [sorted_by_w[0][0]] if sorted_by_w else []
+    top3_t = [x[0] for x in sorted_by_w[:3]] if sorted_by_w else []
+
+    # 最大セクターの銘柄群（既知セクターのみ）
+    max_sector_keys: List[str] = []
+    if sector_weights:
+        max_sec = max(sector_weights.items(), key=lambda x: x[1])[0]
+        max_sector_keys = [t for t in mv_map.keys() if sector_map.get(t, "") == max_sec]
+
+    # 相関上位ペアの銘柄2つ
+    corr_pair_keys: List[str] = []
+    if corr_pair[0]:
+        a, b = corr_pair[0].split("-", 1)
+        corr_pair_keys = [a, b]
+
+    s1 = -0.10
+    s2 = -0.20
+    s3 = -0.30 * _w_sum(top1_t)
+    s4 = -0.20 * _w_sum(top3_t)
+    s5 = -0.15 * _w_sum(max_sector_keys)
+    s6 = -0.15 * _w_sum(corr_pair_keys)
+    s7 = (-(var95) if var95 is not None else "")
+    s8 = (worst if worst is not None else "")
+
+    stress_pct = [s1, s2, s3, s4, s5, s6, s7, s8]
+    stress_yen = []
+    for x in stress_pct:
+        if isinstance(x, (int, float)) and total_mv > 0:
+            stress_yen.append(x * total_mv)
+        else:
+            stress_yen.append("")
+
+    k1r3: List[List[Any]] = [
+        ["S1 All(-10%)", "S2 All(-20%)", "S3 Top1(-30%)", "S4 Top3(-20%)", "S5 MaxSector(-15%)", "S6 TopCorrPair(-15%)", "S7 VaR95", "S8 WorstDay"],
+        stress_pct,
+        stress_yen,
+    ]
+    ws.update(range_name="K1", values=k1r3, value_input_option="USER_ENTERED")
+
+
 def main():
     today = dt.datetime.now(JST).date()
     skip, reason = is_skip_day_jst(today)
@@ -696,8 +1032,8 @@ def main():
     secrets, settings = load_secrets()
     ws = open_worksheet(secrets)
 
-    # A=銘柄コード, B=銘柄名（固定・秘匿）, C=株数, D=取得単価
-    rows = ws.get("A2:D")
+    # A=銘柄コード, B=銘柄名, C=株数, D=取得単価（SBI CSV想定）
+    rows = ws.get("A5:D")
     if not rows:
         print("RUN: rows=0")
         return
@@ -715,26 +1051,54 @@ def main():
         f"DL: total={stats['total']} ok={stats['ok']} fail={stats['fail']} rate_limited_batches={stats['rate_limited_batches']} retries<= {settings.yf_retry_max}"
     )
 
-    outputs: List[List[Any]] = []
+    # セクター（33業種）マップ（取れない場合は空欄）
+    sector_map = _build_sector_for_raws(tickers)
+
+    outputs44: List[List[Any]] = []
+    extras4: List[List[Any]] = []
+
     for r in rows:
         ticker = (r[0] if len(r) > 0 else "").strip()
+        shares_raw = (r[2] if len(r) > 2 else "")
         cost_raw = (r[3] if len(r) > 3 else "")
+
+        shares = _to_float(shares_raw)
+        shares = float(shares) if shares is not None else 0.0
+
         cost = None
         try:
-            cost = float(cost_raw) if str(cost_raw).strip() != "" else None
+            v = _to_float(cost_raw)
+            cost = float(v) if v is not None else None
         except Exception:
             cost = None
 
         if not ticker:
-            outputs.append([""] * 44)
+            outputs44.append([""] * 44)
+            extras4.append(["", "", "", ""])
             continue
 
-        outputs.append(compute_row_outputs(ticker, cost, settings))
+        out = compute_row_outputs(ticker, cost, settings)
+        outputs44.append(out)
 
-    ws.update(range_name="E2", values=outputs, value_input_option="USER_ENTERED")
+        # 追加4列：AW=時価, AX=ウェイト(後で埋める), AY=含み損益(円), AZ=セクター
+        price = out[0]
+        if isinstance(price, (int, float)) and shares > 0:
+            mv = float(price) * shares
+            pnl_yen = ((float(price) - cost) * shares) if (cost is not None) else ""
+            extras4.append([mv, "", pnl_yen, sector_map.get(ticker, "")])
+        else:
+            extras4.append(["", "", "", sector_map.get(ticker, "")])
+
+    # 既存44列（E5開始）
+    ws.update(range_name="E5", values=outputs44, value_input_option="USER_ENTERED")
+    # 追加4列（AW5開始：時価/ウェイト/含み損益/セクター）
+    ws.update(range_name="AW5", values=extras4, value_input_option="USER_ENTERED")
+
+    # 上部ブロック（A1:J3, K1:R3）
+    _compute_portfolio_and_write_top(ws, rows, outputs44, extras4, sector_map)
 
     # ログは件数のみ
-    print(f"SHEET_UPDATE: rows={len(outputs)}")
+    print(f"SHEET_UPDATE: rows={len(outputs44)}")
 
 
 if __name__ == "__main__":
